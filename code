@@ -1,0 +1,183 @@
+# Read the csv files into dataframes
+import numpy as np
+import pandas as pd
+
+bill_amount = pd.read_csv("bill_amount.csv",header=0,index_col = False)
+bill_patient = pd.read_csv("bill_id.csv",header=0,index_col = False)
+patient_clinical = pd.read_csv("clinical_data.csv",header=0,index_col = False)
+patient_demographics = pd.read_csv("demographics.csv",header=0, index_col = False)
+
+# 1. Explore the datasets
+## bill_amount
+print(bill_amount.head(),'\n')
+print(bill_amount.dtypes,'\n')
+print(bill_amount.describe(),'\n')
+print(bill_amount.isnull().sum(),'\n')
+
+## bill_patient
+print(bill_patient.head(),'\n')
+print(bill_patient.shape,'\n')
+print(bill_patient.dtypes,'\n')
+print(bill_patient.isnull().sum(),'\n')
+
+print(bill_patient.groupby('patient_id')['date_of_admission'].nunique().describe(),'\n') # There are 3000 different patients, some patient has more than one treatment records
+print(bill_patient.groupby('bill_id')[['patient_id','date_of_admission']].nunique().describe(),'\n') # Each bill records correspond to a unique combination of (patient_id, date_of_admission). let us define it as a "treatment"
+print(bill_patient.groupby(['patient_id','date_of_admission'])['bill_id'].nunique().describe(),'\n') # Each treatment has 4 bill records, there are 3400 treatment records
+
+## patient_clinical
+print(patient_clinical.shape,'\n')
+print(patient_clinical.dtypes,'\n')
+print(patient_clinical.isnull().sum(),'\n')
+print(patient_clinical['medical_history_3'].unique())
+
+# convert the "No" in medical_history_3 to 0, "Yes" to 1
+patient_clinical = patient_clinical.set_value(patient_clinical[patient_clinical['medical_history_3'] == 'No'].index,'medical_history_3', '0')
+patient_clinical = patient_clinical.set_value(patient_clinical[patient_clinical['medical_history_3'] == 'Yes'].index,'medical_history_3', '1')
+# convert medical_history_3 to int
+patient_clinical = patient_clinical.astype({'medical_history_3': np.int64})
+
+print(patient_clinical.dtypes)
+print(patient_clinical.describe())
+print(len(patient_clinical[['id','date_of_admission']].drop_duplicates()))  
+# Same as the length of the dataframe, hence each treatment has only one clinical data record
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+features = patient_clinical.drop(['id','date_of_admission','date_of_discharge'],axis=1).columns
+%matplotlib notebook
+plt.figure()
+corr = patient_clinical.dropna()[features].corr()
+sns_plot = sns.heatmap(corr, xticklabels = corr.columns.values, yticklabels = corr.columns.values)
+
+## patient_demographics
+print(patient_demographics.head(),'\n')
+print(patient_demographics.shape,'\n')
+print(patient_demographics.dtypes,'\n')
+print(patient_demographics.isnull().sum(),'\n')
+print(patient_demographics['gender'].unique(), patient_demographics['race'].unique(), patient_demographics['resident_status'].unique())
+
+# Convert the 'f' and 'm' in gender to 'Female' and 'Male'
+patient_demographics = patient_demographics.set_value(patient_demographics[patient_demographics['gender']=='f'].index,'gender', 'Female')
+patient_demographics = patient_demographics.set_value(patient_demographics[patient_demographics['gender']=='m'].index,'gender', 'Male')
+
+# Convert the 'India' and 'chinese' in race to 'Indian' and 'Chinese'
+patient_demographics = patient_demographics.set_value(patient_demographics[patient_demographics['race']=='India'].index,'race', 'Indian')
+patient_demographics = patient_demographics.set_value(patient_demographics[patient_demographics['race']=='chinese'].index,'race', 'Chinese')
+
+# Convert the 'Singaporean' to 'Singapore citizen' in resident_status
+patient_demographics=patient_demographics.set_value(patient_demographics[patient_demographics['resident_status']=='Singaporean'].index,'resident_status', 'Singapore citizen')
+
+print(patient_demographics['gender'].unique(), patient_demographics['race'].unique(), patient_demographics['resident_status'].unique())
+
+
+
+# 2. Join the datasets together
+# Firstly, join the bill_amount and bill_patient, then calculate the cost of each treatment
+bill = bill_amount.merge(bill_patient, left_on = 'bill_id', right_on = 'bill_id', how = 'inner')
+#bill.head()
+
+treatment_cost = bill.groupby(['patient_id','date_of_admission']).agg({'amount':sum})
+#treatment_cost.head()
+
+# Next, join the treatment_cost and clinical data
+treatment = treatment_cost.merge(patient_clinical, left_index = True, right_on = ['id','date_of_admission'], how = 'inner')
+#treatment.head()
+
+# Lastly, join the treatment data and demographics data
+cost_of_care = treatment.merge(patient_demographics, left_on = 'id', right_on = 'patient_id', how = 'inner')
+cost_of_care.head()
+
+## Create new features with existing metrics
+cost_of_care['age'] = cost_of_care['date_of_admission'].str.slice(start=0,stop=4).astype('int') - cost_of_care['date_of_birth'].str.slice(start=0, stop=4).astype('int')
+cost_of_care['duration'] = pd.to_datetime(cost_of_care['date_of_discharge']) - pd.to_datetime(cost_of_care['date_of_admission'])
+cost_of_care['duration'] = cost_of_care['duration'].astype('<m8[D]').astype(np.int64)
+
+## Missing Values
+# calculate the percentage of records without missing values
+print(len(cost_of_care.dropna())/len(cost_of_care))
+# Drop the rows with missing values
+cost = cost_of_care.dropna().astype({'medical_history_2':np.int64,'medical_history_5':np.int64})
+cost.dtypes
+
+
+
+# 3. Fit a model to predict the cost of care
+# Find correlations among the continuous variables
+import matplotlib.pyplot as plt
+%matplotlib notebook
+continuous = ['lab_result_1','lab_result_2','lab_result_3','weight','height','age']
+df = cost[continuous]
+print(df.corr())
+axes = pd.plotting.scatter_matrix(df, alpha=0.2)
+plt.tight_layout()
+# The features are not closely related to each other
+
+from sklearn.model_selection import train_test_split
+cost_reg = pd.get_dummies(cost.drop(['id','date_of_admission','date_of_discharge','patient_id','date_of_birth'],axis=1),drop_first=True)
+y = cost_reg['amount']
+X = cost_reg.drop('amount',axis=1)
+X_train, X_test, y_train, y_test = train_test_split(X,y,test_size = 0.2, random_state=2018)
+
+from sklearn.tree import DecisionTreeRegressor
+Tree = DecisionTreeRegressor(random_state=2018).fit(X_train,y_train)
+
+importances = pd.Series(Tree.feature_importances_, index=X.columns).sort_values(ascending = False)
+print(importances,'\n')
+print(Tree.score(X_test, y_test))
+
+## Fit a Random Forest Regressor using the features with importances larger than 0.01
+features = ['symptom_5','race','resident_status','age','medical_history_1','weight','symptom_3','symptom_4','symptom_2','lab_result_2','medical_history_6']
+            
+from sklearn.ensemble import RandomForestRegressor
+X = pd.get_dummies(cost[features], drop_first=True)
+y = cost['amount']
+X_train, X_test, y_train, y_test = train_test_split(X,y,test_size = 0.2, random_state=2018)
+RF = RandomForestRegressor(n_estimators=10,random_state=2018).fit(X_train, y_train)
+print(pd.Series(RF.feature_importances_,index=X.columns).sort_values(ascending=False),'\n')
+print(RF.score(X_test,y_test))
+# Hence the most important drivers for cost of care are symptom_5, race, age at the date of admission, and resident status
+
+# 4. Cost of Care and symptom_5, race, age, and resident status 
+## Cost of Care and Symptom_5
+import seaborn as sns
+sns.set()
+plt.figure()
+sns_symptom_5 = sns.boxplot(x = 'symptom_5', y = 'amount', data = cost).set_title('Cost of Care and Symptom_5')
+#sns_symptom_5.get_figure().savefig('symptom 5 and cost.png')
+
+import seaborn as sns
+plt.figure()
+sns.distplot(cost[cost['symptom_5']==0].amount, norm_hist = False)
+sns.distplot(cost[cost['symptom_5']==1].amount, norm_hist = False)
+#plt.savefig('symptom_5 hist.png')
+
+## Cost of Care and Race
+plt.figure()
+sns_race = sns.boxplot(x='race',y='amount',data=cost).set_title('Cost of Care and Race')
+#sns_race.get_figure().savefig('race and cost.png')
+
+plt.figure()
+sns.distplot(cost[cost['race']=='Chinese'].amount, norm_hist = True)
+sns.distplot(cost[cost['race']=='Indian'].amount, norm_hist = True)
+sns.distplot(cost[cost['race']=='Malay'].amount, norm_hist = True)
+sns.distplot(cost[cost['race']=='Others'].amount, norm_hist = True)
+#plt.savefig('race hist.png')
+
+## Cost of Care and Age
+plt.figure()
+plt.plot(cost.groupby('age').agg({'amount': np.mean}))
+plt.xlabel('age')
+plt.ylabel('amount')
+plt.title('Cost of Care and Age');
+#plt.savefig('age and cost.png')
+
+## Cost of Care and Resident Status
+plt.figure()
+sns_resident_status = sns.boxplot(x='resident_status',y='amount',data=cost).set_title('Cost of Care and Resident Status')
+#sns_resident_status.get_figure().savefig('resident status and cost')
+
+plt.figure()
+sns.distplot(cost[cost['resident_status']=='Singapore citizen'].amount, norm_hist = False)
+sns.distplot(cost[cost['resident_status']=='Foreigner'].amount, norm_hist = False)
+sns.distplot(cost[cost['resident_status']=='PR'].amount, norm_hist = False)
+#plt.savefig('resident status hist.png')
